@@ -67,7 +67,7 @@ DEFAULT_ASSETS = [
     AssetConfig("XLE", "에너지 섹터", 0.075, "금", 2000.0, 0.0, 0.0),
 ]
 
-ASSET_SCHEMA_VERSION = 2
+ASSET_SCHEMA_VERSION = 3
 
 
 @st.cache_data(ttl=3600)
@@ -1045,6 +1045,17 @@ def main() -> None:
     st.session_state["assets_df"]["day_of_week"] = st.session_state["assets_df"][
         "day_of_week"
     ].map(canonical_day_label)
+
+    if st.sidebar.button("자산 설정 초기화"):
+        st.session_state["assets_df"] = pd.DataFrame([a.__dict__ for a in DEFAULT_ASSETS])[
+            asset_columns
+        ]
+        st.session_state["assets_df"]["day_of_week"] = st.session_state["assets_df"][
+            "day_of_week"
+        ].map(canonical_day_label)
+        st.session_state["assets_version"] = ASSET_SCHEMA_VERSION
+        st.session_state["show_day_fix_notice"] = True
+        st.rerun()
     assets_df_sidebar = st.sidebar.data_editor(
         st.session_state["assets_df"],
         num_rows="fixed",
