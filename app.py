@@ -249,7 +249,8 @@ def normalize_weights(assets: List[AssetConfig]) -> List[AssetConfig]:
 
 
 def weekday_frequency(day_name: str) -> str:
-    day_key = day_name.strip().upper()[:3]
+    normalized = normalize_day_name(str(day_name))
+    day_key = normalized.strip().upper()[:3]
     weekday = DAY_NAME_TO_INT.get(day_key, 0)
     return INT_TO_FREQ[weekday]
 
