@@ -67,6 +67,8 @@ DEFAULT_ASSETS = [
     AssetConfig("XLE", "에너지 섹터", 0.075, "금", 2000.0, 0.0, 0.0),
 ]
 
+ASSET_SCHEMA_VERSION = 2
+
 
 @st.cache_data(ttl=3600)
 def download_prices(tickers: List[str], start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
@@ -184,6 +186,11 @@ def canonical_day_label(value: object) -> str:
     }
     normalized = normalize_day_name(str(value))
     return kor_days.get(normalized, "월")
+
+
+def cycle_weekdays(count: int) -> List[str]:
+    cycle = ["월", "화", "수", "목", "금", "토", "일"]
+    return [cycle[i % len(cycle)] for i in range(count)]
 
 
 def coerce_float(value: object, default: float = 0.0) -> float:
@@ -1009,6 +1016,32 @@ def main() -> None:
         st.session_state["assets_df"] = pd.DataFrame([a.__dict__ for a in DEFAULT_ASSETS])[
             asset_columns
         ]
+
+    if st.session_state.get("assets_version", 0) < ASSET_SCHEMA_VERSION:
+        assets_df_migrate = st.session_state["assets_df"].copy()
+        for col in asset_columns:
+            if col not in assets_df_migrate.columns:
+                assets_df_migrate[col] = 0.0
+        assets_df_migrate["ticker"] = (
+            assets_df_migrate["ticker"].astype(str).str.upper().str.strip()
+        )
+        assets_df_migrate["day_of_week"] = assets_df_migrate["day_of_week"].map(
+            canonical_day_label
+        )
+        if assets_df_migrate["day_of_week"].nunique() == 1 and len(assets_df_migrate) >= 5:
+            default_day_map = {a.ticker: a.day_of_week for a in DEFAULT_ASSETS}
+            mapped = assets_df_migrate["ticker"].map(default_day_map)
+            if mapped.notna().any():
+                assets_df_migrate["day_of_week"] = mapped.fillna(
+                    assets_df_migrate["day_of_week"]
+                )
+            if assets_df_migrate["day_of_week"].nunique() == 1:
+                assets_df_migrate["day_of_week"] = cycle_weekdays(len(assets_df_migrate))
+            st.session_state["show_day_fix_notice"] = True
+
+        st.session_state["assets_df"] = assets_df_migrate[asset_columns]
+        st.session_state["assets_version"] = ASSET_SCHEMA_VERSION
+
     st.session_state["assets_df"]["day_of_week"] = st.session_state["assets_df"][
         "day_of_week"
     ].map(canonical_day_label)
@@ -1044,6 +1077,9 @@ def main() -> None:
     if holdings_file is not None:
         include_actual = st.sidebar.checkbox("실제 보유 포함", value=True)
     holdings_bytes = holdings_file.getvalue() if holdings_file is not None else None
+
+    if st.session_state.pop("show_day_fix_notice", False):
+        st.info("요일 값이 모두 동일해 월~금으로 자동 배치했습니다. 자산 편집에서 확인하세요.")
 
     assets, asset_warnings = parse_assets(st.session_state["assets_df"])
     if asset_warnings:
