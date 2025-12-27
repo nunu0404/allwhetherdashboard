@@ -123,8 +123,53 @@ def download_fx_rates(start_date: dt.date, end_date: dt.date) -> pd.Series:
 def normalize_day_name(value: str) -> str:
     if not value:
         return "Mon"
-    value = value.strip().upper()[:3]
-    return value.capitalize() if value in DAY_NAME_TO_INT else "Mon"
+    raw = str(value).strip()
+    if not raw:
+        return "Mon"
+    kor_map = {
+        "월": "Mon",
+        "월요일": "Mon",
+        "화": "Tue",
+        "화요일": "Tue",
+        "수": "Wed",
+        "수요일": "Wed",
+        "목": "Thu",
+        "목요일": "Thu",
+        "금": "Fri",
+        "금요일": "Fri",
+        "토": "Sat",
+        "토요일": "Sat",
+        "일": "Sun",
+        "일요일": "Sun",
+    }
+    if raw in kor_map:
+        return kor_map[raw]
+    if raw and raw[0] in kor_map:
+        return kor_map[raw[0]]
+
+    upper = raw.upper()
+    eng_full = {
+        "MONDAY": "Mon",
+        "TUESDAY": "Tue",
+        "WEDNESDAY": "Wed",
+        "THURSDAY": "Thu",
+        "FRIDAY": "Fri",
+        "SATURDAY": "Sat",
+        "SUNDAY": "Sun",
+    }
+    if upper in eng_full:
+        return eng_full[upper]
+
+    value3 = upper[:3]
+    if value3 in DAY_NAME_TO_INT:
+        return value3.capitalize()
+
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if 0 <= idx <= 6:
+            return list(DAY_NAME_TO_INT.keys())[idx].capitalize()
+
+    return "Mon"
 
 
 def coerce_float(value: object, default: float = 0.0) -> float:
