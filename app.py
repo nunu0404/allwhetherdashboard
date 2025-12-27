@@ -67,6 +67,17 @@ DEFAULT_ASSETS = [
     AssetConfig("XLE", "에너지 섹터", 0.075, "금", 2000.0, 0.0, 0.0),
 ]
 
+MANUAL_TX_COLUMNS = [
+    "date",
+    "ticker",
+    "name",
+    "shares",
+    "price_usd",
+    "amount_usd",
+    "amount_base",
+    "fx_rate",
+]
+
 ASSET_SCHEMA_VERSION = 3
 
 
@@ -198,6 +209,16 @@ def coerce_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def normalize_manual_tx_df(df: pd.DataFrame | None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=MANUAL_TX_COLUMNS)
+    data = df.copy()
+    for col in MANUAL_TX_COLUMNS:
+        if col not in data.columns:
+            data[col] = np.nan
+    return data[MANUAL_TX_COLUMNS]
 
 
 def parse_assets(df: pd.DataFrame) -> Tuple[List[AssetConfig], List[str]]:
@@ -742,6 +763,13 @@ def extract_holdings_tickers(holdings_bytes: bytes) -> List[str]:
     return sorted({ticker for ticker in tickers if ticker})
 
 
+def extract_manual_tickers(df: pd.DataFrame | None) -> List[str]:
+    if df is None or df.empty or "ticker" not in df.columns:
+        return []
+    tickers = df["ticker"].astype(str).str.upper().str.strip()
+    return sorted({ticker for ticker in tickers if ticker})
+
+
 def parse_actual_holdings(
     uploaded_file: object,
     base_currency: str,
@@ -820,6 +848,121 @@ def parse_actual_holdings(
         }
     )
     return parsed, warnings
+
+
+def parse_manual_transactions(
+    df: pd.DataFrame,
+    base_currency: str,
+    fx_rates: pd.Series | None,
+    fx_mode: str,
+    fx_lock_rate: float,
+    asset_name_map: Dict[str, str] | None = None,
+) -> Tuple[pd.DataFrame, List[str]]:
+    if df is None or df.empty:
+        return pd.DataFrame(), []
+    warnings: List[str] = []
+    rows = []
+    data = normalize_manual_tx_df(df)
+    for idx, row in data.iterrows():
+        ticker = str(row.get("ticker", "")).strip().upper()
+        if not ticker:
+            warnings.append(f"{idx + 1}행: 티커가 비어 있습니다.")
+            continue
+        raw_date = row.get("date")
+        date_ts = pd.to_datetime(raw_date, errors="coerce")
+        if pd.isna(date_ts):
+            warnings.append(f"{idx + 1}행: 날짜가 올바르지 않습니다.")
+            continue
+        date = date_ts.date()
+
+        name = str(row.get("name", "")).strip()
+        if not name and asset_name_map:
+            name = asset_name_map.get(ticker, "")
+        if not name:
+            name = ticker
+
+        shares = coerce_float(row.get("shares"), np.nan)
+        price_usd = coerce_float(row.get("price_usd"), np.nan)
+        amount_usd = coerce_float(row.get("amount_usd"), np.nan)
+        amount_base = coerce_float(row.get("amount_base"), np.nan)
+        fx_rate = coerce_float(row.get("fx_rate"), np.nan)
+
+        if base_currency == "KRW" and (pd.isna(fx_rate) or fx_rate <= 0):
+            if fx_mode == "live" and fx_rates is not None and not fx_rates.empty:
+                fx_rate = get_fx_rate_at_date(fx_rates, date)
+            else:
+                fx_rate = fx_lock_rate
+        elif base_currency == "USD":
+            fx_rate = np.nan
+
+        if pd.isna(amount_usd) or amount_usd <= 0:
+            if not pd.isna(price_usd) and price_usd > 0 and not pd.isna(shares) and shares > 0:
+                amount_usd = price_usd * shares
+            elif base_currency == "USD" and not pd.isna(amount_base) and amount_base > 0:
+                amount_usd = amount_base
+            elif (
+                base_currency == "KRW"
+                and not pd.isna(amount_base)
+                and amount_base > 0
+                and not pd.isna(fx_rate)
+                and fx_rate > 0
+            ):
+                amount_usd = amount_base / fx_rate
+
+        if pd.isna(shares) or shares <= 0:
+            if not pd.isna(amount_usd) and amount_usd > 0 and not pd.isna(price_usd) and price_usd > 0:
+                shares = amount_usd / price_usd
+            elif (
+                base_currency == "KRW"
+                and not pd.isna(amount_base)
+                and amount_base > 0
+                and not pd.isna(price_usd)
+                and price_usd > 0
+                and not pd.isna(fx_rate)
+                and fx_rate > 0
+            ):
+                shares = (amount_base / fx_rate) / price_usd
+
+        if pd.isna(amount_base) or amount_base <= 0:
+            if base_currency == "USD":
+                if not pd.isna(amount_usd) and amount_usd > 0:
+                    amount_base = amount_usd
+            elif not pd.isna(amount_usd) and amount_usd > 0 and not pd.isna(fx_rate) and fx_rate > 0:
+                amount_base = amount_usd * fx_rate
+
+        if pd.isna(price_usd) or price_usd <= 0:
+            if not pd.isna(amount_usd) and amount_usd > 0 and not pd.isna(shares) and shares > 0:
+                price_usd = amount_usd / shares
+
+        if pd.isna(shares) or shares <= 0:
+            warnings.append(f"{idx + 1}행: 수량을 계산할 수 없어 제외했습니다.")
+            continue
+        if pd.isna(amount_usd) or amount_usd <= 0:
+            warnings.append(f"{idx + 1}행: 매수금(USD)을 계산할 수 없어 제외했습니다.")
+            continue
+        if pd.isna(amount_base) or amount_base <= 0:
+            warnings.append(
+                f"{idx + 1}행: 매수금({base_currency})을 계산할 수 없어 제외했습니다."
+            )
+            continue
+
+        rows.append(
+            {
+                "date": pd.Timestamp(date),
+                "ticker": ticker,
+                "name": name,
+                "shares": shares,
+                "price_usd": price_usd,
+                "amount_usd": amount_usd,
+                "amount_base": amount_base,
+                "fx_rate": fx_rate,
+            }
+        )
+
+    transactions = pd.DataFrame(rows)
+    if not transactions.empty:
+        transactions = transactions.sort_values(["date", "ticker"]).reset_index(drop=True)
+    return transactions, warnings
 
 
 def build_rebalance_plan(
@@ -915,7 +1058,7 @@ def format_currency(value: float, currency: str) -> str:
 def main() -> None:
     st.set_page_config(page_title="ETF 자동투자 대시보드", layout="wide")
     st.title("ETF 자동투자 대시보드")
-    st.caption("주간 매수 계획 기반 시뮬레이션 대시보드입니다. 실제 거래내역이 아닙니다.")
+    st.caption("계획 기반 시뮬레이션과 직접 입력 매수 내역을 함께 지원합니다.")
 
     with st.expander("보유 CSV 형식 (선택 업로드)"):
         st.write("필수 컬럼: ticker, shares. 선택: cost_base, cost_usd, avg_cost_base, avg_cost_usd, name.")
@@ -935,6 +1078,19 @@ def main() -> None:
             "CSV 템플릿 다운로드",
             template.to_csv(index=False).encode("utf-8"),
             file_name="holdings_template.csv",
+            mime="text/csv",
+        )
+
+    with st.expander("매수 내역 CSV 형식 (직접 입력용)"):
+        st.write(
+            "필수 컬럼: date, ticker. 선택: name, shares, price_usd, amount_usd, amount_base, fx_rate."
+        )
+        tx_template = pd.DataFrame(columns=MANUAL_TX_COLUMNS)
+        st.code(tx_template.to_csv(index=False), language="csv")
+        st.download_button(
+            "CSV 템플릿 다운로드",
+            tx_template.to_csv(index=False).encode("utf-8"),
+            file_name="manual_transactions_template.csv",
             mime="text/csv",
         )
 
@@ -981,6 +1137,14 @@ def main() -> None:
     if st.sidebar.button("데이터 새로고침"):
         st.cache_data.clear()
         st.rerun()
+
+    st.sidebar.header("매수 내역")
+    tx_source = st.sidebar.radio(
+        "매수 내역 기준",
+        ["계획(시뮬레이션)", "직접 입력"],
+        index=0,
+    )
+    use_manual_transactions = tx_source == "직접 입력"
 
     st.sidebar.header("리마인더")
     deposit_day = st.sidebar.number_input(
@@ -1083,6 +1247,50 @@ def main() -> None:
     assets_df_main["day_of_week"] = assets_df_main["day_of_week"].map(canonical_day_label)
     st.session_state["assets_df"] = assets_df_main
 
+    with st.expander("매수 내역 입력(직접)", expanded=use_manual_transactions):
+        st.caption(
+            "직접 입력 모드는 실제 체결가 기반 평균단가를 계산합니다. "
+            "계획/리마인더는 기존 매수 계획을 그대로 사용합니다."
+        )
+        manual_column_config = {
+            "date": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
+            "ticker": "티커",
+            "name": "이름",
+            "shares": st.column_config.NumberColumn("수량", format="%.6f"),
+            "price_usd": st.column_config.NumberColumn("체결가(USD)", format="%.4f"),
+            "amount_usd": st.column_config.NumberColumn("매수금(USD)", format="%.2f"),
+            "amount_base": st.column_config.NumberColumn(
+                f"매수금({base_currency})", format="%.2f"
+            ),
+            "fx_rate": st.column_config.NumberColumn("환율(KRW/USD)", format="%.2f"),
+        }
+        if "manual_tx_df" not in st.session_state:
+            st.session_state["manual_tx_df"] = normalize_manual_tx_df(None)
+
+        manual_upload = st.file_uploader("매수 내역 CSV 업로드", type=["csv"])
+        if manual_upload is not None and st.button("업로드 적용"):
+            try:
+                uploaded_df = pd.read_csv(manual_upload)
+            except Exception as exc:
+                st.error(f"CSV를 읽을 수 없습니다: {exc}")
+            else:
+                st.session_state["manual_tx_df"] = normalize_manual_tx_df(uploaded_df)
+                st.success("매수 내역을 불러왔습니다.")
+
+        if st.button("매수 내역 초기화"):
+            st.session_state["manual_tx_df"] = normalize_manual_tx_df(None)
+            st.rerun()
+
+        manual_tx_df = st.data_editor(
+            st.session_state["manual_tx_df"],
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config=manual_column_config,
+            key="manual_tx_editor",
+        )
+        st.session_state["manual_tx_df"] = normalize_manual_tx_df(manual_tx_df)
+
     st.sidebar.header("실제 보유(선택)")
     holdings_file = st.sidebar.file_uploader("CSV 업로드", type=["csv"])
     include_actual = True
@@ -1097,6 +1305,7 @@ def main() -> None:
     if asset_warnings:
         for message in asset_warnings:
             st.warning(message)
+    asset_name_map = {asset.ticker: asset.name for asset in assets}
 
     normalize = st.sidebar.checkbox("비중 100%로 정규화", value=True)
     if normalize:
@@ -1140,11 +1349,19 @@ def main() -> None:
     if not np.isclose(weights_sum, 1.0) and weights_sum > 0:
         st.warning("비중 합계가 100%가 아닙니다. 정규화를 고려하세요.")
 
+    manual_df = st.session_state.get("manual_tx_df")
+    has_manual_rows = (
+        isinstance(manual_df, pd.DataFrame) and not manual_df.dropna(how="all").empty
+    )
     if start_date > today:
-        st.info("매수 시작일이 미래입니다. 현재는 거래 내역이 없습니다.")
+        if use_manual_transactions and has_manual_rows:
+            st.info("매수 시작일은 미래지만 직접 입력 내역이 있어 계산에 반영합니다.")
+        else:
+            st.info("매수 시작일이 미래입니다. 현재는 거래 내역이 없습니다.")
 
     holdings_tickers = extract_holdings_tickers(holdings_bytes)
-    tickers = sorted({a.ticker for a in assets}.union(holdings_tickers))
+    manual_tickers = extract_manual_tickers(st.session_state.get("manual_tx_df"))
+    tickers = sorted({a.ticker for a in assets}.union(holdings_tickers).union(manual_tickers))
     unknown_holdings = set(holdings_tickers) - {a.ticker for a in assets}
     if unknown_holdings:
         st.warning(
@@ -1152,11 +1369,26 @@ def main() -> None:
             + ", ".join(sorted(unknown_holdings))
             + ". 목표 비중은 비어 있습니다."
         )
+    unknown_manual = set(manual_tickers) - {a.ticker for a in assets}
+    if unknown_manual:
+        st.warning(
+            "직접 입력 내역에 계획에 없는 티커가 있습니다: "
+            + ", ".join(sorted(unknown_manual))
+            + ". 목표 비중은 비어 있습니다."
+        )
     if not tickers:
         st.error("유효한 티커가 없습니다.")
         st.stop()
 
-    price_start = start_date if start_date <= today else today - dt.timedelta(days=30)
+    manual_date_min = None
+    if isinstance(manual_df, pd.DataFrame) and "date" in manual_df.columns:
+        manual_dates = pd.to_datetime(manual_df["date"], errors="coerce").dropna()
+        if not manual_dates.empty:
+            manual_date_min = manual_dates.min().date()
+    history_start = start_date
+    if manual_date_min and manual_date_min < history_start:
+        history_start = manual_date_min
+    price_start = history_start if history_start <= today else today - dt.timedelta(days=30)
     with st.spinner("가격 데이터를 불러오는 중..."):
         prices_usd = download_prices(tickers, price_start, today)
         fx_rates = download_fx_rates(price_start, today) if base_currency == "KRW" else None
@@ -1182,11 +1414,20 @@ def main() -> None:
     else:
         fx_rate_for_value = np.nan
 
+    manual_transactions, manual_warnings = parse_manual_transactions(
+        st.session_state.get("manual_tx_df", pd.DataFrame()),
+        base_currency,
+        fx_rates,
+        fx_mode,
+        fx_lock_rate,
+        asset_name_map,
+    )
+
     if start_date > today:
-        transactions = pd.DataFrame()
-        tx_warnings = []
+        transactions_planned = pd.DataFrame()
+        planned_warnings = []
     else:
-        transactions, tx_warnings = build_transactions(
+        transactions_planned, planned_warnings = build_transactions(
             assets,
             start_date,
             today,
@@ -1200,17 +1441,27 @@ def main() -> None:
             fx_lock_rate,
         )
 
+    if use_manual_transactions:
+        transactions = manual_transactions
+        tx_warnings = manual_warnings
+    else:
+        transactions = transactions_planned
+        tx_warnings = planned_warnings
+
     if tx_warnings:
         for message in tx_warnings[:5]:
             st.warning(message)
         if len(tx_warnings) > 5:
             st.warning("추가 경고가 생략되었습니다.")
 
-    if transactions.empty and start_date <= today:
-        st.error("거래 내역이 생성되지 않았습니다. 날짜 또는 입력값을 확인하세요.")
-        st.stop()
+    if transactions.empty:
+        if use_manual_transactions:
+            st.warning("직접 입력 매수 내역이 없습니다. 매수 내역을 입력하세요.")
+        elif start_date <= today:
+            st.error("거래 내역이 생성되지 않았습니다. 날짜 또는 입력값을 확인하세요.")
+            st.stop()
 
-    positions_sim = positions_from_transactions(transactions)
+    positions_selected = positions_from_transactions(transactions)
     positions_actual, holdings_warnings = parse_actual_holdings(
         io.BytesIO(holdings_bytes) if holdings_bytes else None,
         base_currency,
@@ -1219,20 +1470,31 @@ def main() -> None:
     if holdings_warnings:
         for message in holdings_warnings:
             st.warning(message)
+    if use_manual_transactions and include_actual and holdings_bytes:
+        st.warning("직접 입력 내역과 보유 CSV를 함께 사용하면 중복 집계될 수 있습니다.")
     positions_combined = (
-        combine_positions([positions_sim, positions_actual])
+        combine_positions([positions_selected, positions_actual])
         if include_actual
-        else positions_sim
+        else positions_selected
     )
 
     summary = build_summary_from_positions(
         assets, positions_combined, prices_usd, fx_rate_for_value, base_currency
     )
     timeseries = build_daily_timeseries(
-        transactions, prices_usd, fx_rates, base_currency, fx_mode, fx_lock_rate, start_date, today
+        transactions,
+        prices_usd,
+        fx_rates,
+        base_currency,
+        fx_mode,
+        fx_lock_rate,
+        history_start,
+        today,
     )
 
-    simulated_invested = positions_sim["cost_base"].sum() if not positions_sim.empty else 0.0
+    selected_invested = (
+        positions_selected["cost_base"].sum() if not positions_selected.empty else 0.0
+    )
     actual_invested = (
         positions_actual["cost_base"].sum() if (include_actual and not positions_actual.empty) else 0.0
     )
@@ -1255,7 +1517,8 @@ def main() -> None:
 
     if include_actual and not positions_actual.empty:
         extra1, extra2 = st.columns(2)
-        extra1.metric("시뮬레이션 투자금", format_currency(simulated_invested, base_currency))
+        label_selected = "직접 입력 매입금" if use_manual_transactions else "시뮬레이션 투자금"
+        extra1.metric(label_selected, format_currency(selected_invested, base_currency))
         extra2.metric("실제 보유 매입금", format_currency(actual_invested, base_currency))
 
     st.subheader("리마인더")
@@ -1520,7 +1783,8 @@ def main() -> None:
         st.line_chart(chart_df, height=300)
 
     st.subheader("납입/매수 리포트")
-    st.caption("시뮬레이션 매수 기준입니다.")
+    report_caption = "직접 입력 매수 기준입니다." if use_manual_transactions else "시뮬레이션 매수 기준입니다."
+    st.caption(report_caption)
     daily_tab, weekly_tab, monthly_tab = st.tabs(["일간", "주간", "월간"])
 
     for tab, period in [
@@ -1568,7 +1832,8 @@ def main() -> None:
                 },
             )
 
-    st.subheader("최근 매수 내역(계획)")
+    recent_label = "최근 매수 내역(직접 입력)" if use_manual_transactions else "최근 매수 내역(계획)"
+    st.subheader(recent_label)
     if transactions.empty:
         st.write("아직 매수 내역이 없습니다.")
     else:
@@ -1579,9 +1844,11 @@ def main() -> None:
             lambda x: format_currency(x, base_currency)
         )
         recent_display["price_usd"] = recent_display["price_usd"].map(
-            lambda x: f"{x:,.2f} USD"
+            lambda x: f"{x:,.2f} USD" if not pd.isna(x) else "-"
         )
-        recent_display["shares"] = recent_display["shares"].map(lambda x: f"{x:,.6f}")
+        recent_display["shares"] = recent_display["shares"].map(
+            lambda x: f"{x:,.6f}" if not pd.isna(x) else "-"
+        )
         st.dataframe(
             recent_display,
             use_container_width=True,
