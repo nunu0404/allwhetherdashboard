@@ -60,11 +60,11 @@ class AssetConfig:
 
 
 DEFAULT_ASSETS = [
-    AssetConfig("VOO", "S&P500", 0.30, "Mon", 7500.0, 0.0, 0.0),
-    AssetConfig("TLT", "20년+ 국채", 0.40, "Tue", 10000.0, 0.0, 0.0),
-    AssetConfig("IEF", "7-10년 국채", 0.15, "Wed", 3500.0, 0.0, 0.0),
-    AssetConfig("GLD", "금", 0.075, "Thu", 2000.0, 0.0, 0.0),
-    AssetConfig("XLE", "에너지 섹터", 0.075, "Fri", 2000.0, 0.0, 0.0),
+    AssetConfig("VOO", "S&P500", 0.30, "월", 7500.0, 0.0, 0.0),
+    AssetConfig("TLT", "20년+ 국채", 0.40, "화", 10000.0, 0.0, 0.0),
+    AssetConfig("IEF", "7-10년 국채", 0.15, "수", 3500.0, 0.0, 0.0),
+    AssetConfig("GLD", "금", 0.075, "목", 2000.0, 0.0, 0.0),
+    AssetConfig("XLE", "에너지 섹터", 0.075, "금", 2000.0, 0.0, 0.0),
 ]
 
 
@@ -170,6 +170,20 @@ def normalize_day_name(value: str) -> str:
             return list(DAY_NAME_TO_INT.keys())[idx].capitalize()
 
     return "Mon"
+
+
+def canonical_day_label(value: object) -> str:
+    kor_days = {
+        "Mon": "월",
+        "Tue": "화",
+        "Wed": "수",
+        "Thu": "목",
+        "Fri": "금",
+        "Sat": "토",
+        "Sun": "일",
+    }
+    normalized = normalize_day_name(str(value))
+    return kor_days.get(normalized, "월")
 
 
 def coerce_float(value: object, default: float = 0.0) -> float:
@@ -982,7 +996,11 @@ def main() -> None:
         "ticker": "티커",
         "name": "이름",
         "weight": "비중",
-        "day_of_week": "요일(Mon~Sun)",
+        "day_of_week": st.column_config.SelectboxColumn(
+            "요일",
+            options=["월", "화", "수", "목", "금", "토", "일"],
+            required=True,
+        ),
         "weekly_amount_base": "주간 금액",
         "target_amount_base": "목표 금액",
         "target_shares": "목표 수량",
@@ -991,6 +1009,9 @@ def main() -> None:
         st.session_state["assets_df"] = pd.DataFrame([a.__dict__ for a in DEFAULT_ASSETS])[
             asset_columns
         ]
+    st.session_state["assets_df"]["day_of_week"] = st.session_state["assets_df"][
+        "day_of_week"
+    ].map(canonical_day_label)
     assets_df_sidebar = st.sidebar.data_editor(
         st.session_state["assets_df"],
         num_rows="fixed",
@@ -998,6 +1019,9 @@ def main() -> None:
         hide_index=True,
         column_config=asset_column_config,
         key="assets_editor_sidebar",
+    )
+    assets_df_sidebar["day_of_week"] = assets_df_sidebar["day_of_week"].map(
+        canonical_day_label
     )
     st.session_state["assets_df"] = assets_df_sidebar
 
@@ -1011,6 +1035,7 @@ def main() -> None:
         column_config=asset_column_config,
         key="assets_editor_main",
     )
+    assets_df_main["day_of_week"] = assets_df_main["day_of_week"].map(canonical_day_label)
     st.session_state["assets_df"] = assets_df_main
 
     st.sidebar.header("실제 보유(선택)")
