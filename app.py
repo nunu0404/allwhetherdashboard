@@ -1153,23 +1153,45 @@ def main() -> None:
         plan_mode,
         trading_days,
     )
-    next_buy_row = upcoming_reminders.iloc[0] if not upcoming_reminders.empty else None
+    next_buy_rows = None
+    next_buy_total = None
+    if not upcoming_reminders.empty:
+        next_buy_date = upcoming_reminders["date"].min()
+        next_buy_rows = upcoming_reminders[upcoming_reminders["date"] == next_buy_date].copy()
+        next_buy_total = next_buy_rows["planned_amount_base"].sum()
 
     rem_col1, rem_col2 = st.columns(2)
     rem_col1.metric(
         "다음 납입일",
         f"{next_deposit.isoformat()} (D-{days_to_deposit})" if days_to_deposit >= 0 else "-",
     )
-    if next_buy_row is not None:
+    if next_buy_rows is not None:
         rem_col2.metric(
-            "다음 매수",
-            f"{next_buy_row['date'].date()} {next_buy_row['ticker']} "
-            f"({format_currency(next_buy_row['planned_amount_base'], base_currency)})",
+            "다음 매수일",
+            f"{next_buy_rows['date'].iloc[0].date()} (총 {format_currency(next_buy_total, base_currency)})",
         )
     else:
-        rem_col2.metric("다음 매수", "-")
+        rem_col2.metric("다음 매수일", "-")
 
     if not upcoming_reminders.empty:
+        if next_buy_rows is not None:
+            st.write("다음 매수 상세")
+            next_display = next_buy_rows.copy()
+            next_display["date"] = next_display["date"].dt.date
+            next_display["planned_amount_base"] = next_display["planned_amount_base"].map(
+                lambda x: format_currency(x, base_currency)
+            )
+            st.dataframe(
+                next_display,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "date": "날짜",
+                    "ticker": "티커",
+                    "name": "이름",
+                    "planned_amount_base": "예정 매수금",
+                },
+            )
         reminder_display = upcoming_reminders.copy()
         reminder_display["date"] = reminder_display["date"].dt.date
         reminder_display["planned_amount_base"] = reminder_display["planned_amount_base"].map(
