@@ -394,6 +394,35 @@ def get_manual_tx_path() -> Path:
     return base_dir / "manual_transactions.csv"
 
 
+def get_manual_tx_backup_dir() -> Path:
+    base_dir = Path(__file__).resolve().parent / "data" / "manual_tx_backups"
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return Path(__file__).resolve().parent
+    return base_dir
+
+
+def list_manual_tx_backups() -> List[Path]:
+    backup_dir = get_manual_tx_backup_dir()
+    if not backup_dir.exists():
+        return []
+    backups = sorted(backup_dir.glob("manual_tx_*.csv"), key=lambda p: p.name, reverse=True)
+    return backups
+
+
+def format_backup_label(path: Path) -> str:
+    stem = path.stem
+    if stem.startswith("manual_tx_"):
+        raw = stem.replace("manual_tx_", "")
+        try:
+            parsed = dt.datetime.strptime(raw, "%Y%m%d_%H%M%S")
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return path.name
+    return path.name
+
+
 def manual_tx_digest(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return ""
@@ -419,6 +448,28 @@ def save_manual_tx_file(df: pd.DataFrame, path: Path) -> str | None:
     return None
 
 
+def create_manual_tx_backup(df: pd.DataFrame) -> str | None:
+    backup_dir = get_manual_tx_backup_dir()
+    digest = manual_tx_digest(df)
+    if not digest or digest == st.session_state.get("manual_tx_backup_digest"):
+        return None
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_dir / f"manual_tx_{timestamp}.csv"
+    try:
+        df.to_csv(backup_path, index=False)
+    except Exception as exc:
+        return f"직접 입력 내역 백업에 실패했습니다: {exc}"
+    st.session_state["manual_tx_backup_digest"] = digest
+
+    backups = list_manual_tx_backups()
+    for old_path in backups[30:]:
+        try:
+            old_path.unlink()
+        except OSError:
+            continue
+    return None
+
+
 def persist_manual_tx_df(df: pd.DataFrame) -> str | None:
     path = get_manual_tx_path()
     if df is None or df.empty:
@@ -434,6 +485,9 @@ def persist_manual_tx_df(df: pd.DataFrame) -> str | None:
         error = save_manual_tx_file(df, path)
         if error is None:
             st.session_state["manual_tx_last_digest"] = digest
+            backup_error = create_manual_tx_backup(df)
+            if backup_error:
+                return backup_error
         return error
     return None
 
@@ -1577,6 +1631,7 @@ def main() -> None:
         loaded_manual, load_error = load_manual_tx_file(manual_path)
         st.session_state["manual_tx_df"] = loaded_manual
         st.session_state["manual_tx_last_digest"] = manual_tx_digest(loaded_manual)
+        st.session_state["manual_tx_backup_digest"] = manual_tx_digest(loaded_manual)
         if load_error:
             st.warning(load_error)
 
@@ -1829,6 +1884,7 @@ def main() -> None:
                 st.error(f"CSV를 읽을 수 없습니다: {exc}")
             else:
                 st.session_state["manual_tx_df"] = normalize_manual_tx_df(uploaded_df)
+                st.session_state["manual_tx_last_digest"] = ""
                 st.success("매수 내역을 불러왔습니다.")
 
         if st.button("매수 내역 초기화"):
@@ -1847,6 +1903,30 @@ def main() -> None:
             key="manual_tx_editor",
         )
         st.session_state["manual_tx_df"] = normalize_manual_tx_df(manual_tx_df)
+
+        st.divider()
+        st.caption("백업/복원")
+        backup_files = list_manual_tx_backups()
+        if backup_files:
+            backup_labels = [format_backup_label(path) for path in backup_files]
+            selected_label = st.selectbox(
+                "백업 선택",
+                options=backup_labels,
+                index=0,
+                key="backup_selector",
+            )
+            selected_path = backup_files[backup_labels.index(selected_label)]
+            if st.button("선택한 백업 복원"):
+                restored_df, restore_error = load_manual_tx_file(selected_path)
+                if restore_error:
+                    st.warning(restore_error)
+                else:
+                    st.session_state["manual_tx_df"] = restored_df
+                    st.session_state["manual_tx_last_digest"] = ""
+                    st.success("선택한 백업으로 복원했습니다.")
+                    st.rerun()
+        else:
+            st.caption("사용 가능한 백업이 없습니다.")
 
     holdings_tickers = extract_holdings_tickers(holdings_bytes)
     persist_error = persist_manual_tx_df(st.session_state["manual_tx_df"])

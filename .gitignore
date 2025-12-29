@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .DS_Store
 data/manual_transactions.csv
+data/manual_tx_backups/
