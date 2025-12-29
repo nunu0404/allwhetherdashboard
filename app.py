@@ -1,8 +1,10 @@
 import calendar
 import datetime as dt
+import hashlib
 import io
 from bisect import bisect_left
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -125,6 +127,51 @@ def download_prices(tickers: List[str], start_date: dt.date, end_date: dt.date) 
 
     prices.index = pd.to_datetime(prices.index).tz_localize(None)
     return prices
+
+
+def fetch_latest_prices(tickers: List[str]) -> pd.Series:
+    if not tickers:
+        return pd.Series(dtype=float)
+    try:
+        data = yf.download(
+            tickers,
+            period="1d",
+            interval="1m",
+            prepost=True,
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+        )
+    except Exception:
+        return pd.Series(dtype=float)
+    if data is None or data.empty:
+        return pd.Series(dtype=float)
+
+    latest: Dict[str, float] = {}
+    if isinstance(data.columns, pd.MultiIndex):
+        for ticker in tickers:
+            if ticker in data.columns.get_level_values(0):
+                series = None
+                if (ticker, "Close") in data.columns:
+                    series = data[(ticker, "Close")]
+                elif (ticker, "Adj Close") in data.columns:
+                    series = data[(ticker, "Adj Close")]
+                if series is None:
+                    continue
+                series = series.dropna()
+                if not series.empty:
+                    latest[ticker] = float(series.iloc[-1])
+    else:
+        series = None
+        if "Close" in data.columns:
+            series = data["Close"]
+        elif "Adj Close" in data.columns:
+            series = data["Adj Close"]
+        if series is not None:
+            series = series.dropna()
+            if not series.empty:
+                latest[tickers[0]] = float(series.iloc[-1])
+    return pd.Series(latest, dtype=float)
 
 
 @st.cache_data(ttl=3600)
@@ -338,6 +385,59 @@ def normalize_entry_df(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     return data[columns]
 
 
+def get_manual_tx_path() -> Path:
+    base_dir = Path(__file__).resolve().parent / "data"
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return Path(__file__).resolve().parent / "manual_transactions.csv"
+    return base_dir / "manual_transactions.csv"
+
+
+def manual_tx_digest(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return ""
+    csv_text = df.to_csv(index=False)
+    return hashlib.md5(csv_text.encode("utf-8")).hexdigest()
+
+
+def load_manual_tx_file(path: Path) -> Tuple[pd.DataFrame, str | None]:
+    if not path.exists():
+        return normalize_manual_tx_df(None), None
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        return normalize_manual_tx_df(None), f"직접 입력 내역 파일을 읽지 못했습니다: {exc}"
+    return normalize_manual_tx_df(df), None
+
+
+def save_manual_tx_file(df: pd.DataFrame, path: Path) -> str | None:
+    try:
+        df.to_csv(path, index=False)
+    except Exception as exc:
+        return f"직접 입력 내역 파일을 저장하지 못했습니다: {exc}"
+    return None
+
+
+def persist_manual_tx_df(df: pd.DataFrame) -> str | None:
+    path = get_manual_tx_path()
+    if df is None or df.empty:
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError as exc:
+                return f"직접 입력 내역 파일을 삭제하지 못했습니다: {exc}"
+        st.session_state["manual_tx_last_digest"] = ""
+        return None
+    digest = manual_tx_digest(df)
+    if digest != st.session_state.get("manual_tx_last_digest"):
+        error = save_manual_tx_file(df, path)
+        if error is None:
+            st.session_state["manual_tx_last_digest"] = digest
+        return error
+    return None
+
+
 def dataframe_to_pdf_bytes(title: str, df: pd.DataFrame) -> bytes | None:
     if not REPORTLAB_AVAILABLE:
         return None
@@ -410,7 +510,7 @@ def merge_manual_price_entries(
                 "date": date,
                 "ticker": ticker,
                 "name": str(row.get("name", "")).strip(),
-                "shares": np.nan,
+                "shares": coerce_float(row.get("shares"), np.nan),
                 "price_usd": coerce_float(row.get("price_usd"), np.nan),
                 "price_krw": coerce_float(row.get("price_krw"), np.nan),
                 "amount_usd": np.nan,
@@ -1362,10 +1462,13 @@ def main() -> None:
             "시작일 고정": "start",
             "사용자 지정 고정": "custom",
         }[fx_choice]
-    if st.sidebar.button("데이터 새로고침"):
-        st.session_state["refresh_nonce"] = st.session_state.get("refresh_nonce", 0) + 1
-        st.cache_data.clear()
-        st.rerun()
+        use_prepost = st.sidebar.checkbox(
+            "장외 가격 포함(새로고침 시)", value=True
+        )
+        if st.sidebar.button("데이터 새로고침"):
+            st.session_state["refresh_nonce"] = st.session_state.get("refresh_nonce", 0) + 1
+            st.cache_data.clear()
+            st.rerun()
 
     use_manual_transactions = True
 
@@ -1470,7 +1573,12 @@ def main() -> None:
     assets_df_main["day_of_week"] = assets_df_main["day_of_week"].map(canonical_day_label)
     st.session_state["assets_df"] = assets_df_main
     if "manual_tx_df" not in st.session_state:
-        st.session_state["manual_tx_df"] = normalize_manual_tx_df(None)
+        manual_path = get_manual_tx_path()
+        loaded_manual, load_error = load_manual_tx_file(manual_path)
+        st.session_state["manual_tx_df"] = loaded_manual
+        st.session_state["manual_tx_last_digest"] = manual_tx_digest(loaded_manual)
+        if load_error:
+            st.warning(load_error)
 
     st.sidebar.header("실제 보유(선택)")
     holdings_file = st.sidebar.file_uploader("CSV 업로드", type=["csv"])
@@ -1692,6 +1800,9 @@ def main() -> None:
                 st.session_state["manual_tx_df"] = merge_manual_price_entries(
                     st.session_state.get("manual_tx_df"), price_entry_df
                 )
+                st.session_state["manual_tx_df"] = normalize_manual_tx_df(
+                    st.session_state["manual_tx_df"]
+                )
                 st.success("직접 입력 내역에 반영했습니다.")
 
         st.divider()
@@ -1722,6 +1833,9 @@ def main() -> None:
 
         if st.button("매수 내역 초기화"):
             st.session_state["manual_tx_df"] = normalize_manual_tx_df(None)
+            persist_error = persist_manual_tx_df(st.session_state["manual_tx_df"])
+            if persist_error:
+                st.warning(persist_error)
             st.rerun()
 
         manual_tx_df = st.data_editor(
@@ -1735,6 +1849,9 @@ def main() -> None:
         st.session_state["manual_tx_df"] = normalize_manual_tx_df(manual_tx_df)
 
     holdings_tickers = extract_holdings_tickers(holdings_bytes)
+    persist_error = persist_manual_tx_df(st.session_state["manual_tx_df"])
+    if persist_error:
+        st.warning(persist_error)
     manual_tickers = extract_manual_tickers(st.session_state.get("manual_tx_df"))
     tickers = sorted({a.ticker for a in assets}.union(holdings_tickers).union(manual_tickers))
     unknown_holdings = set(holdings_tickers) - {a.ticker for a in assets}
@@ -1780,6 +1897,28 @@ def main() -> None:
             if base_currency == "KRW" or manual_fx_needed
             else None
         )
+
+    refresh_nonce = st.session_state.get("refresh_nonce", 0)
+    if (
+        use_prepost
+        and refresh_nonce > 0
+        and st.session_state.get("last_live_price_nonce") != refresh_nonce
+    ):
+        live_prices = fetch_latest_prices(tickers)
+        if not live_prices.empty:
+            st.session_state["last_live_prices"] = live_prices
+        st.session_state["last_live_price_nonce"] = refresh_nonce
+
+    live_prices = st.session_state.get("last_live_prices") if use_prepost else None
+    if use_prepost and isinstance(live_prices, pd.Series) and not live_prices.empty:
+        live_date = pd.Timestamp(today)
+        prices_usd = prices_usd.copy()
+        if live_date not in prices_usd.index:
+            prices_usd.loc[live_date] = np.nan
+        for ticker, value in live_prices.items():
+            if ticker in prices_usd.columns and not pd.isna(value):
+                prices_usd.at[live_date, ticker] = value
+        prices_usd = prices_usd.sort_index()
 
     if not prices_usd.empty:
         st.session_state["last_prices_usd"] = prices_usd
