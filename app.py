@@ -26,6 +26,15 @@ try:
 except ImportError:
     mcal = None
 
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import landscape, letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
 
 DAY_NAME_TO_INT = {
     "MON": 0,
@@ -301,6 +310,61 @@ def normalize_entry_df(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
         if col in data.columns:
             data[col] = pd.to_numeric(data[col], errors="coerce").round(6)
     return data[columns]
+
+
+def dataframe_to_pdf_bytes(title: str, df: pd.DataFrame) -> bytes | None:
+    if not REPORTLAB_AVAILABLE:
+        return None
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter))
+    styles = getSampleStyleSheet()
+    elements = [Paragraph(title, styles["Heading2"]), Spacer(1, 12)]
+    safe_df = df.copy().astype(str)
+    table_data = [safe_df.columns.tolist()] + safe_df.values.tolist()
+    table = Table(table_data, repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
+    elements.append(table)
+    doc.build(elements)
+    return buffer.getvalue()
+
+
+def render_download_buttons(
+    label: str,
+    df: pd.DataFrame,
+    filename_prefix: str,
+    key_prefix: str,
+) -> None:
+    if df is None or df.empty:
+        return
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    col_csv, col_pdf = st.columns(2)
+    col_csv.download_button(
+        f"{label} CSV 다운로드",
+        data=csv_bytes,
+        file_name=f"{filename_prefix}.csv",
+        mime="text/csv",
+        key=f"{key_prefix}_csv",
+    )
+    if REPORTLAB_AVAILABLE:
+        pdf_bytes = dataframe_to_pdf_bytes(label, df)
+        col_pdf.download_button(
+            f"{label} PDF 다운로드",
+            data=pdf_bytes,
+            file_name=f"{filename_prefix}.pdf",
+            mime="application/pdf",
+            key=f"{key_prefix}_pdf",
+        )
+    else:
+        col_pdf.caption("PDF 다운로드는 reportlab 설치가 필요합니다.")
 
 
 def merge_manual_price_entries(
@@ -1231,39 +1295,6 @@ def main() -> None:
     st.title("ETF 자동투자 대시보드")
     st.caption("직접 입력한 매수 내역을 기반으로 계산합니다.")
 
-    with st.expander("보유 CSV 형식 (선택 업로드)"):
-        st.write("필수 컬럼: ticker, shares. 선택: cost_base, cost_usd, avg_cost_base, avg_cost_usd, name.")
-        template = pd.DataFrame(
-            [
-                {
-                    "ticker": "VOO",
-                    "shares": 1.25,
-                    "cost_base": 180000,
-                    "cost_usd": 135.0,
-                    "name": "Vanguard S&P 500 ETF",
-                }
-            ]
-        )
-        st.code(template.to_csv(index=False), language="csv")
-        st.download_button(
-            "CSV 템플릿 다운로드",
-            template.to_csv(index=False).encode("utf-8"),
-            file_name="holdings_template.csv",
-            mime="text/csv",
-        )
-
-    with st.expander("매수 내역 CSV 형식 (직접 입력용)"):
-        st.write(
-            "필수 컬럼: date, ticker. 선택: name, shares, price_usd, price_krw, amount_usd, amount_base, fx_rate."
-        )
-        tx_template = pd.DataFrame(columns=MANUAL_TX_COLUMNS)
-        st.code(tx_template.to_csv(index=False), language="csv")
-        st.download_button(
-            "CSV 템플릿 다운로드",
-            tx_template.to_csv(index=False).encode("utf-8"),
-            file_name="manual_transactions_template.csv",
-            mime="text/csv",
-        )
 
     today = dt.date.today()
 
@@ -1930,6 +1961,13 @@ def main() -> None:
 
     st.subheader("보유 현황")
     holdings_tab, targets_tab = st.tabs(["보유 현황", "목표"])
+    if not summary.empty:
+        render_download_buttons(
+            "보유 현황",
+            summary,
+            f"holdings_{today.isoformat()}",
+            "holdings",
+        )
 
     with holdings_tab:
         display = summary.copy()
@@ -1993,6 +2031,13 @@ def main() -> None:
 
     with targets_tab:
         targets = summary.copy()
+        if not targets.empty:
+            render_download_buttons(
+                "목표 현황",
+                targets,
+                f"targets_{today.isoformat()}",
+                "targets",
+            )
         targets["target_weight"] = targets["target_weight"].map(
             lambda x: f"{x:.2%}" if not pd.isna(x) else "-"
         )
@@ -2056,6 +2101,12 @@ def main() -> None:
     if rebalance.empty:
         st.write("현재 입력값으로 리밸런싱 가이드를 만들 수 없습니다.")
     else:
+        render_download_buttons(
+            "리밸런싱 가이드",
+            rebalance,
+            f"rebalance_{today.isoformat()}",
+            "rebalance",
+        )
         rebalance_display = rebalance.copy()
         rebalance_display["target_weight"] = rebalance_display["target_weight"].map(
             lambda x: f"{x:.2%}"
@@ -2133,6 +2184,23 @@ def main() -> None:
             if totals.empty:
                 st.write("데이터가 없습니다.")
                 continue
+            period_label = {
+                "daily": "일간",
+                "weekly": "주간",
+                "monthly": "월간",
+            }[period]
+            render_download_buttons(
+                f"{period_label} 리포트(총괄)",
+                totals,
+                f"report_{period}_totals_{today.isoformat()}",
+                f"report_{period}_totals",
+            )
+            render_download_buttons(
+                f"{period_label} 리포트(자산별)",
+                by_asset,
+                f"report_{period}_by_asset_{today.isoformat()}",
+                f"report_{period}_by_asset",
+            )
             totals_display = totals.copy()
             totals_display["invested_base"] = totals_display["invested_base"].map(
                 lambda x: format_currency(x, base_currency)
