@@ -47,6 +47,7 @@ INT_TO_FREQ = {
     6: "W-SUN",
 }
 
+FIXED_START_DATE = dt.date(2025, 12, 29)
 
 @dataclass
 class AssetConfig:
@@ -1213,7 +1214,7 @@ def format_unit_price(value: float, currency: str) -> str:
 def main() -> None:
     st.set_page_config(page_title="ETF 자동투자 대시보드", layout="wide")
     st.title("ETF 자동투자 대시보드")
-    st.caption("계획 기반 시뮬레이션과 직접 입력 매수 내역을 함께 지원합니다.")
+    st.caption("직접 입력한 매수 내역을 기반으로 계산합니다.")
 
     with st.expander("보유 CSV 형식 (선택 업로드)"):
         st.write("필수 컬럼: ticker, shares. 선택: cost_base, cost_usd, avg_cost_base, avg_cost_usd, name.")
@@ -1250,10 +1251,10 @@ def main() -> None:
         )
 
     today = dt.date.today()
-    default_start = next_weekday(today, 0)
 
     st.sidebar.header("계획 설정")
-    start_date = st.sidebar.date_input("시작일", value=default_start)
+    st.sidebar.date_input("시작일", value=FIXED_START_DATE, disabled=True)
+    start_date = FIXED_START_DATE
     plan_choice = st.sidebar.selectbox(
         "매수 방식",
         ["월 납입액+비중", "주간 고정금액(종목별)"],
@@ -1293,13 +1294,7 @@ def main() -> None:
         st.cache_data.clear()
         st.rerun()
 
-    st.sidebar.header("매수 내역")
-    tx_source = st.sidebar.radio(
-        "매수 내역 기준",
-        ["계획(시뮬레이션)", "직접 입력"],
-        index=0,
-    )
-    use_manual_transactions = tx_source == "직접 입력"
+    use_manual_transactions = True
 
     st.sidebar.header("리마인더")
     deposit_day = st.sidebar.number_input(
@@ -1467,7 +1462,7 @@ def main() -> None:
         isinstance(manual_df, pd.DataFrame) and not manual_df.dropna(how="all").empty
     )
     if start_date > today:
-        if use_manual_transactions and has_manual_rows:
+        if has_manual_rows:
             st.info("매수 시작일은 미래지만 직접 입력 내역이 있어 계산에 반영합니다.")
         else:
             st.info("매수 시작일이 미래입니다. 현재는 거래 내역이 없습니다.")
@@ -1668,6 +1663,12 @@ def main() -> None:
             else None
         )
 
+    if not prices_usd.empty:
+        st.session_state["last_prices_usd"] = prices_usd
+    elif "last_prices_usd" in st.session_state:
+        prices_usd = st.session_state["last_prices_usd"]
+        st.warning("가격 데이터 갱신에 실패해 이전 데이터를 사용합니다.")
+
     if prices_usd.empty:
         st.error("가격 데이터가 없습니다. 티커나 네트워크를 확인하세요.")
         st.caption(
@@ -1685,12 +1686,18 @@ def main() -> None:
     fx_lock_rate = np.nan
     if base_currency == "KRW":
         if fx_rates is None or fx_rates.empty:
-            st.error("환율 데이터가 없습니다. 네트워크나 환율 설정을 확인하세요.")
-            st.stop()
+            if "last_fx_rates" in st.session_state:
+                fx_rates = st.session_state["last_fx_rates"]
+                st.warning("환율 데이터 갱신에 실패해 이전 데이터를 사용합니다.")
+            else:
+                st.error("환율 데이터가 없습니다. 네트워크나 환율 설정을 확인하세요.")
+                st.stop()
         fx_lock_rate = resolve_fx_lock_rate(fx_rates, fx_mode, custom_fx_rate, start_date)
         if fx_mode != "live" and pd.isna(fx_lock_rate):
             st.error("고정 환율을 계산할 수 없습니다. 환율 데이터 또는 사용자 입력을 확인하세요.")
             st.stop()
+    if fx_rates is not None and not fx_rates.empty:
+        st.session_state["last_fx_rates"] = fx_rates
 
     if base_currency == "KRW":
         fx_rate_for_value = (
@@ -1735,30 +1742,8 @@ def main() -> None:
         asset_name_map,
     )
 
-    if start_date > today:
-        transactions_planned = pd.DataFrame()
-        planned_warnings = []
-    else:
-        transactions_planned, planned_warnings = build_transactions(
-            assets,
-            start_date,
-            today,
-            monthly_contribution_effective,
-            prices_usd,
-            fx_rates,
-            base_currency,
-            plan_mode,
-            trading_days,
-            fx_mode,
-            fx_lock_rate,
-        )
-
-    if use_manual_transactions:
-        transactions = manual_transactions
-        tx_warnings = manual_warnings
-    else:
-        transactions = transactions_planned
-        tx_warnings = planned_warnings
+    transactions = manual_transactions
+    tx_warnings = manual_warnings
 
     if tx_warnings:
         for message in tx_warnings[:5]:
@@ -1767,11 +1752,7 @@ def main() -> None:
             st.warning("추가 경고가 생략되었습니다.")
 
     if transactions.empty:
-        if use_manual_transactions:
-            st.warning("직접 입력 매수 내역이 없습니다. 매수 내역을 입력하세요.")
-        elif start_date <= today:
-            st.error("거래 내역이 생성되지 않았습니다. 날짜 또는 입력값을 확인하세요.")
-            st.stop()
+        st.warning("직접 입력 매수 내역이 없습니다. 매수 내역을 입력하세요.")
 
     positions_selected = positions_from_transactions(transactions)
     positions_actual, holdings_warnings = parse_actual_holdings(
@@ -1782,7 +1763,7 @@ def main() -> None:
     if holdings_warnings:
         for message in holdings_warnings:
             st.warning(message)
-    if use_manual_transactions and include_actual and holdings_bytes:
+    if include_actual and holdings_bytes:
         st.warning("직접 입력 내역과 보유 CSV를 함께 사용하면 중복 집계될 수 있습니다.")
     positions_combined = (
         combine_positions([positions_selected, positions_actual])
@@ -1829,8 +1810,7 @@ def main() -> None:
 
     if include_actual and not positions_actual.empty:
         extra1, extra2 = st.columns(2)
-        label_selected = "직접 입력 매입금" if use_manual_transactions else "시뮬레이션 투자금"
-        extra1.metric(label_selected, format_currency(selected_invested, base_currency))
+        extra1.metric("직접 입력 매입금", format_currency(selected_invested, base_currency))
         extra2.metric("실제 보유 매입금", format_currency(actual_invested, base_currency))
 
     st.subheader("리마인더")
@@ -2094,8 +2074,7 @@ def main() -> None:
         st.line_chart(chart_df, height=300)
 
     st.subheader("납입/매수 리포트")
-    report_caption = "직접 입력 매수 기준입니다." if use_manual_transactions else "시뮬레이션 매수 기준입니다."
-    st.caption(report_caption)
+    st.caption("직접 입력 매수 기준입니다.")
     daily_tab, weekly_tab, monthly_tab = st.tabs(["일간", "주간", "월간"])
 
     for tab, period in [
@@ -2143,8 +2122,7 @@ def main() -> None:
                 },
             )
 
-    recent_label = "최근 매수 내역(직접 입력)" if use_manual_transactions else "최근 매수 내역(계획)"
-    st.subheader(recent_label)
+    st.subheader("최근 매수 내역(직접 입력)")
     if transactions.empty:
         st.write("아직 매수 내역이 없습니다.")
     else:
