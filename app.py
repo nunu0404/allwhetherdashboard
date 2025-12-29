@@ -268,9 +268,11 @@ def autofill_manual_tx_df(
 
         needs_fx = base_currency == "KRW" or (not pd.isna(price_krw) and price_krw > 0)
         if needs_fx and (pd.isna(fx_rate) or fx_rate <= 0):
-            if fx_mode == "live" and fx_rates is not None and not fx_rates.empty:
+            if fx_mode == "custom" and not pd.isna(fx_lock_rate):
+                fx_rate = fx_lock_rate
+            elif fx_rates is not None and not fx_rates.empty:
                 fx_rate = get_fx_rate_at_date(fx_rates, date)
-            else:
+            elif not pd.isna(fx_lock_rate):
                 fx_rate = fx_lock_rate
 
         if pd.isna(price_krw) and not pd.isna(price_usd) and price_usd > 0:
@@ -286,6 +288,19 @@ def autofill_manual_tx_df(
 
     data["date"] = data["date"].dt.date
     return normalize_manual_tx_df(data)
+
+
+def normalize_entry_df(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    data = df.copy()
+    if "date" in data.columns:
+        data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.date
+    if "ticker" in data.columns:
+        data["ticker"] = data["ticker"].astype(str).str.upper().str.strip()
+    numeric_cols = ["amount_base", "price_usd", "price_krw", "fx_rate"]
+    for col in numeric_cols:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors="coerce").round(6)
+    return data[columns]
 
 
 def merge_manual_price_entries(
@@ -1485,19 +1500,27 @@ def main() -> None:
                 entry_month_start = dt.date(entry_date.year, entry_date.month, 1)
                 entry_month_end = dt.date(entry_date.year, entry_date.month, last_day)
                 entry_trading_days = get_us_trading_days(entry_month_start, entry_month_end)
-        planned_for_date = build_upcoming_schedule(
+
+        schedule_window_end = entry_date + dt.timedelta(days=7)
+        planned_window = build_upcoming_schedule(
             assets,
             entry_date,
-            entry_date,
+            schedule_window_end,
             monthly_contribution_effective,
             plan_mode,
             entry_trading_days,
         )
-        if planned_for_date.empty:
-            st.info("해당 날짜에 예정된 매수가 없습니다. 아래 직접 입력 테이블을 사용하세요.")
+        if planned_window.empty:
+            st.info("해당 기간에 예정된 매수가 없습니다. 아래 직접 입력 테이블을 사용하세요.")
         else:
+            next_plan_date = planned_window["date"].min()
+            planned_for_date = planned_window[planned_window["date"] == next_plan_date].copy()
             entry_df = planned_for_date.copy()
             entry_df["date"] = entry_df["date"].dt.date
+            if next_plan_date.date() != entry_date:
+                st.info(
+                    f"{entry_date}에는 예정 매수가 없어 다음 매수일 {next_plan_date.date()} 항목을 표시했습니다."
+                )
             entry_df = entry_df.rename(columns={"planned_amount_base": "amount_base"})
             entry_df["price_usd"] = np.nan
             entry_df["price_krw"] = np.nan
@@ -1543,7 +1566,15 @@ def main() -> None:
                     ]
                 )
 
-            entry_columns = ["date", "ticker", "name", "amount_base", "price_usd", "price_krw", "fx_rate"]
+            entry_columns = [
+                "date",
+                "ticker",
+                "name",
+                "amount_base",
+                "price_usd",
+                "price_krw",
+                "fx_rate",
+            ]
             entry_column_config = {
                 "date": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
                 "ticker": "티커",
@@ -1566,8 +1597,23 @@ def main() -> None:
                 use_container_width=True,
                 hide_index=True,
                 column_config=entry_column_config,
+                disabled=["date", "ticker", "name", "amount_base"],
                 key="price_entry_editor",
             )
+            entry_fx_rates = None
+            entry_fx_lock_rate = custom_fx_rate if fx_mode == "custom" else np.nan
+            if base_currency == "KRW":
+                entry_fx_rates = download_fx_rates(
+                    entry_date - dt.timedelta(days=7), entry_date
+                )
+            auto_entry_df = autofill_manual_tx_df(
+                price_entry_df, entry_fx_rates, fx_mode, entry_fx_lock_rate, base_currency
+            )
+            auto_entry_df = normalize_entry_df(auto_entry_df, entry_columns)
+            price_entry_df = normalize_entry_df(price_entry_df, entry_columns)
+            if not auto_entry_df.equals(price_entry_df):
+                st.session_state["price_entry_df"] = auto_entry_df
+                st.rerun()
             st.session_state["price_entry_df"] = price_entry_df
 
             if st.button("입력 내역 반영"):
