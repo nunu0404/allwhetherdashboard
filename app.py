@@ -91,6 +91,17 @@ def download_prices(tickers: List[str], start_date: dt.date, end_date: dt.date) 
         auto_adjust=True,
         progress=False,
     )
+    if data is None or data.empty:
+        fallback_start = start_date - dt.timedelta(days=30)
+        data = yf.download(
+            tickers,
+            start=fallback_start,
+            end=end_date + dt.timedelta(days=1),
+            auto_adjust=True,
+            progress=False,
+        )
+    if data is None:
+        return pd.DataFrame()
     if isinstance(data, pd.DataFrame) and "Close" in data.columns:
         prices = data["Close"]
     elif isinstance(data, pd.DataFrame) and "Adj Close" in data.columns:
@@ -115,6 +126,17 @@ def download_fx_rates(start_date: dt.date, end_date: dt.date) -> pd.Series:
         auto_adjust=True,
         progress=False,
     )
+    if data is None or data.empty:
+        fallback_start = start_date - dt.timedelta(days=30)
+        data = yf.download(
+            "KRW=X",
+            start=fallback_start,
+            end=end_date + dt.timedelta(days=1),
+            auto_adjust=True,
+            progress=False,
+        )
+    if data is None:
+        return pd.Series(dtype=float)
     if isinstance(data, pd.DataFrame) and "Close" in data.columns:
         rates = data["Close"]
     elif isinstance(data, pd.DataFrame) and "Adj Close" in data.columns:
@@ -220,6 +242,49 @@ def normalize_manual_tx_df(df: pd.DataFrame | None) -> pd.DataFrame:
         if col not in data.columns:
             data[col] = np.nan
     return data[MANUAL_TX_COLUMNS]
+
+
+def autofill_manual_tx_df(
+    df: pd.DataFrame | None,
+    fx_rates: pd.Series | None,
+    fx_mode: str,
+    fx_lock_rate: float,
+    base_currency: str,
+) -> pd.DataFrame:
+    data = normalize_manual_tx_df(df)
+    if data.empty:
+        return data
+    data = data.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    for idx, row in data.iterrows():
+        date_ts = row.get("date")
+        if pd.isna(date_ts):
+            continue
+        date = date_ts.date()
+        price_usd = coerce_float(row.get("price_usd"), np.nan)
+        price_krw = coerce_float(row.get("price_krw"), np.nan)
+        fx_rate = coerce_float(row.get("fx_rate"), np.nan)
+
+        needs_fx = base_currency == "KRW" or (not pd.isna(price_krw) and price_krw > 0)
+        if needs_fx and (pd.isna(fx_rate) or fx_rate <= 0):
+            if fx_mode == "live" and fx_rates is not None and not fx_rates.empty:
+                fx_rate = get_fx_rate_at_date(fx_rates, date)
+            else:
+                fx_rate = fx_lock_rate
+
+        if pd.isna(price_krw) and not pd.isna(price_usd) and price_usd > 0:
+            if not pd.isna(fx_rate) and fx_rate > 0:
+                price_krw = price_usd * fx_rate
+        if pd.isna(price_usd) and not pd.isna(price_krw) and price_krw > 0:
+            if not pd.isna(fx_rate) and fx_rate > 0:
+                price_usd = price_krw / fx_rate
+
+        data.at[idx, "price_usd"] = price_usd
+        data.at[idx, "price_krw"] = price_krw
+        data.at[idx, "fx_rate"] = fx_rate
+
+    data["date"] = data["date"].dt.date
+    return normalize_manual_tx_df(data)
 
 
 def merge_manual_price_entries(
@@ -998,16 +1063,6 @@ def parse_manual_transactions(
                 and base_currency == "KRW"
             ):
                 shares = amount_base / price_krw
-            elif (
-                not pd.isna(amount_base)
-                and amount_base > 0
-                and not pd.isna(price_krw)
-                and price_krw > 0
-                and not pd.isna(fx_rate)
-                and fx_rate > 0
-            ):
-                price_usd = price_krw / fx_rate
-                shares = amount_base / price_usd
 
         if pd.isna(amount_base) or amount_base <= 0:
             if base_currency == "USD":
@@ -1021,6 +1076,9 @@ def parse_manual_transactions(
                 price_usd = price_krw / fx_rate
             elif not pd.isna(amount_usd) and amount_usd > 0 and not pd.isna(shares) and shares > 0:
                 price_usd = amount_usd / shares
+        if pd.isna(price_krw) or price_krw <= 0:
+            if not pd.isna(price_usd) and price_usd > 0 and not pd.isna(fx_rate) and fx_rate > 0:
+                price_krw = price_usd * fx_rate
 
         if pd.isna(shares) or shares <= 0:
             warnings.append(f"{idx + 1}행: 수량을 계산할 수 없어 제외했습니다.")
@@ -1416,7 +1474,7 @@ def main() -> None:
 
     with st.expander("매수 내역 입력(직접)", expanded=use_manual_transactions):
         st.caption(
-            "체결 평균단가를 입력하면 계획된 매수금액을 기준으로 수량과 평단가를 계산합니다."
+            "체결가(USD 또는 KRW)만 입력하면 환율과 계획 매수금액을 이용해 수량/평단가를 자동 계산합니다."
         )
         entry_date = st.date_input(
             "체결가 입력일",
@@ -1612,6 +1670,16 @@ def main() -> None:
 
     if prices_usd.empty:
         st.error("가격 데이터가 없습니다. 티커나 네트워크를 확인하세요.")
+        st.caption(
+            f"요청 티커: {', '.join(tickers)} | 조회 구간: {price_start} ~ {today}"
+        )
+        if any(" " in ticker for ticker in tickers):
+            st.warning("티커에 공백이 포함되어 있습니다. 실제 티커인지 확인하세요.")
+        if price_start == today:
+            st.info(
+                "오늘 시작으로 조회하면 장이 끝나기 전에는 데이터가 비어 있을 수 있습니다. "
+                "시작일을 어제로 바꾸거나 잠시 후 다시 시도하세요."
+            )
         st.stop()
 
     fx_lock_rate = np.nan
@@ -1630,6 +1698,15 @@ def main() -> None:
         )
     else:
         fx_rate_for_value = np.nan
+
+    if use_manual_transactions or has_manual_rows:
+        filled_manual = autofill_manual_tx_df(
+            manual_df, fx_rates, fx_mode, fx_lock_rate, base_currency
+        )
+        if not filled_manual.equals(normalize_manual_tx_df(manual_df)):
+            st.session_state["manual_tx_df"] = filled_manual
+            manual_df = filled_manual
+            st.rerun()
 
     planned_amounts = None
     if manual_date_min and manual_date_max:
