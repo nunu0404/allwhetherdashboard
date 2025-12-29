@@ -260,6 +260,7 @@ def autofill_manual_tx_df(
     fx_mode: str,
     fx_lock_rate: float,
     base_currency: str,
+    force_fx_refresh: bool = False,
 ) -> pd.DataFrame:
     data = normalize_manual_tx_df(df)
     if data.empty:
@@ -274,9 +275,11 @@ def autofill_manual_tx_df(
         price_usd = coerce_float(row.get("price_usd"), np.nan)
         price_krw = coerce_float(row.get("price_krw"), np.nan)
         fx_rate = coerce_float(row.get("fx_rate"), np.nan)
+        amount_base = coerce_float(row.get("amount_base"), np.nan)
+        shares = coerce_float(row.get("shares"), np.nan)
 
         needs_fx = base_currency == "KRW" or (not pd.isna(price_krw) and price_krw > 0)
-        if needs_fx and (pd.isna(fx_rate) or fx_rate <= 0):
+        if needs_fx and (force_fx_refresh or pd.isna(fx_rate) or fx_rate <= 0):
             if fx_mode == "custom" and not pd.isna(fx_lock_rate):
                 fx_rate = fx_lock_rate
             elif fx_rates is not None and not fx_rates.empty:
@@ -284,16 +287,39 @@ def autofill_manual_tx_df(
             elif not pd.isna(fx_lock_rate):
                 fx_rate = fx_lock_rate
 
-        if pd.isna(price_krw) and not pd.isna(price_usd) and price_usd > 0:
-            if not pd.isna(fx_rate) and fx_rate > 0:
+        if not pd.isna(price_usd) and price_usd > 0:
+            if not pd.isna(fx_rate) and fx_rate > 0 and (pd.isna(price_krw) or price_krw <= 0 or force_fx_refresh):
                 price_krw = price_usd * fx_rate
         if pd.isna(price_usd) and not pd.isna(price_krw) and price_krw > 0:
             if not pd.isna(fx_rate) and fx_rate > 0:
                 price_usd = price_krw / fx_rate
 
+        if (pd.isna(shares) or shares <= 0) and not pd.isna(amount_base) and amount_base > 0:
+            if base_currency == "KRW":
+                if not pd.isna(price_krw) and price_krw > 0:
+                    shares = amount_base / price_krw
+                elif (
+                    not pd.isna(price_usd)
+                    and price_usd > 0
+                    and not pd.isna(fx_rate)
+                    and fx_rate > 0
+                ):
+                    shares = (amount_base / fx_rate) / price_usd
+            else:
+                if not pd.isna(price_usd) and price_usd > 0:
+                    shares = amount_base / price_usd
+                elif (
+                    not pd.isna(price_krw)
+                    and price_krw > 0
+                    and not pd.isna(fx_rate)
+                    and fx_rate > 0
+                ):
+                    shares = amount_base / (price_krw / fx_rate)
+
         data.at[idx, "price_usd"] = price_usd
         data.at[idx, "price_krw"] = price_krw
         data.at[idx, "fx_rate"] = fx_rate
+        data.at[idx, "shares"] = shares
 
     data["date"] = data["date"].dt.date
     return normalize_manual_tx_df(data)
@@ -305,7 +331,7 @@ def normalize_entry_df(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
         data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.date
     if "ticker" in data.columns:
         data["ticker"] = data["ticker"].astype(str).str.upper().str.strip()
-    numeric_cols = ["amount_base", "price_usd", "price_krw", "fx_rate"]
+    numeric_cols = ["amount_base", "price_usd", "price_krw", "fx_rate", "shares"]
     for col in numeric_cols:
         if col in data.columns:
             data[col] = pd.to_numeric(data[col], errors="coerce").round(6)
@@ -1337,6 +1363,7 @@ def main() -> None:
             "사용자 지정 고정": "custom",
         }[fx_choice]
     if st.sidebar.button("데이터 새로고침"):
+        st.session_state["refresh_nonce"] = st.session_state.get("refresh_nonce", 0) + 1
         st.cache_data.clear()
         st.rerun()
 
@@ -1556,6 +1583,7 @@ def main() -> None:
             entry_df["price_usd"] = np.nan
             entry_df["price_krw"] = np.nan
             entry_df["fx_rate"] = np.nan
+            entry_df["shares"] = np.nan
 
             existing_manual = normalize_manual_tx_df(st.session_state.get("manual_tx_df"))
             if not existing_manual.empty:
@@ -1605,6 +1633,7 @@ def main() -> None:
                 "price_usd",
                 "price_krw",
                 "fx_rate",
+                "shares",
             ]
             entry_column_config = {
                 "date": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
@@ -1616,6 +1645,7 @@ def main() -> None:
                 "price_usd": st.column_config.NumberColumn("체결가(USD)", format="%.4f"),
                 "price_krw": st.column_config.NumberColumn("체결가(KRW)", format="%.2f"),
                 "fx_rate": st.column_config.NumberColumn("환율(KRW/USD)", format="%.2f"),
+                "shares": st.column_config.NumberColumn("매수 수량", format="%.6f"),
             }
             if st.session_state.get("price_entry_seed") != entry_date:
                 st.session_state["price_entry_seed"] = entry_date
@@ -1628,7 +1658,7 @@ def main() -> None:
                 use_container_width=True,
                 hide_index=True,
                 column_config=entry_column_config,
-                disabled=["date", "ticker", "name", "amount_base"],
+                disabled=["date", "ticker", "name", "amount_base", "shares"],
                 key="price_entry_editor",
             )
             entry_fx_rates = None
@@ -1637,15 +1667,26 @@ def main() -> None:
                 entry_fx_rates = download_fx_rates(
                     entry_date - dt.timedelta(days=7), entry_date
                 )
+            refresh_nonce = st.session_state.get("refresh_nonce", 0)
+            force_fx_refresh = (
+                st.session_state.get("price_entry_refresh_nonce") != refresh_nonce
+            )
             auto_entry_df = autofill_manual_tx_df(
-                price_entry_df, entry_fx_rates, fx_mode, entry_fx_lock_rate, base_currency
+                price_entry_df,
+                entry_fx_rates,
+                fx_mode,
+                entry_fx_lock_rate,
+                base_currency,
+                force_fx_refresh,
             )
             auto_entry_df = normalize_entry_df(auto_entry_df, entry_columns)
             price_entry_df = normalize_entry_df(price_entry_df, entry_columns)
             if not auto_entry_df.equals(price_entry_df):
+                st.session_state["price_entry_refresh_nonce"] = refresh_nonce
                 st.session_state["price_entry_df"] = auto_entry_df
                 st.rerun()
             st.session_state["price_entry_df"] = price_entry_df
+            st.session_state["price_entry_refresh_nonce"] = refresh_nonce
 
             if st.button("입력 내역 반영"):
                 st.session_state["manual_tx_df"] = merge_manual_price_entries(
