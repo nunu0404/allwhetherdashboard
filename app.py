@@ -298,6 +298,19 @@ def normalize_manual_tx_df(df: pd.DataFrame | None) -> pd.DataFrame:
     for col in MANUAL_TX_COLUMNS:
         if col not in data.columns:
             data[col] = np.nan
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
+    data["ticker"] = data["ticker"].astype(str).str.upper().str.strip()
+    data["name"] = data["name"].astype(str).str.strip()
+    numeric_cols = [
+        "shares",
+        "price_usd",
+        "price_krw",
+        "amount_usd",
+        "amount_base",
+        "fx_rate",
+    ]
+    for col in numeric_cols:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
     return data[MANUAL_TX_COLUMNS]
 
 
@@ -368,14 +381,14 @@ def autofill_manual_tx_df(
         data.at[idx, "fx_rate"] = fx_rate
         data.at[idx, "shares"] = shares
 
-    data["date"] = data["date"].dt.date
+    data["date"] = data["date"].dt.normalize()
     return normalize_manual_tx_df(data)
 
 
 def normalize_entry_df(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     data = df.copy()
     if "date" in data.columns:
-        data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.date
+        data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
     if "ticker" in data.columns:
         data["ticker"] = data["ticker"].astype(str).str.upper().str.strip()
     numeric_cols = ["amount_base", "price_usd", "price_krw", "fx_rate", "shares"]
@@ -575,9 +588,9 @@ def merge_manual_price_entries(
     if not entries:
         return existing
     new_df = pd.DataFrame(entries)
-    existing["date"] = pd.to_datetime(existing["date"], errors="coerce")
+    existing["date"] = pd.to_datetime(existing["date"], errors="coerce").dt.normalize()
     existing["ticker"] = existing["ticker"].astype(str).str.upper().str.strip()
-    new_df["date"] = pd.to_datetime(new_df["date"], errors="coerce")
+    new_df["date"] = pd.to_datetime(new_df["date"], errors="coerce").dt.normalize()
     new_df["ticker"] = new_df["ticker"].astype(str).str.upper().str.strip()
     existing_index = existing.set_index(["date", "ticker"]).index
     new_index = new_df.set_index(["date", "ticker"]).index
@@ -1737,7 +1750,7 @@ def main() -> None:
             next_plan_date = planned_window["date"].min()
             planned_for_date = planned_window[planned_window["date"] == next_plan_date].copy()
             entry_df = planned_for_date.copy()
-            entry_df["date"] = entry_df["date"].dt.date
+            entry_df["date"] = pd.to_datetime(entry_df["date"], errors="coerce").dt.normalize()
             if next_plan_date.date() != entry_date:
                 st.info(
                     f"{entry_date}에는 예정 매수가 없어 다음 매수일 {next_plan_date.date()} 항목을 표시했습니다."
@@ -1753,7 +1766,7 @@ def main() -> None:
                 existing_manual = existing_manual.copy()
                 existing_manual["date"] = pd.to_datetime(
                     existing_manual["date"], errors="coerce"
-                ).dt.date
+                ).dt.normalize()
                 existing_manual["ticker"] = (
                     existing_manual["ticker"].astype(str).str.upper().str.strip()
                 )
