@@ -398,6 +398,180 @@ def normalize_entry_df(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     return data[columns]
 
 
+def values_different(left: object, right: object) -> bool:
+    if pd.isna(left) and pd.isna(right):
+        return False
+    try:
+        left_f = float(left)
+        right_f = float(right)
+        if pd.isna(left_f) and pd.isna(right_f):
+            return False
+        return not np.isclose(left_f, right_f, rtol=1e-6, atol=1e-9)
+    except (TypeError, ValueError):
+        return left != right
+
+
+def resolve_fx_rate(
+    date: dt.date,
+    fx_rates: pd.Series | None,
+    fx_mode: str,
+    fx_lock_rate: float,
+    fallback: float,
+) -> float:
+    if fx_mode == "custom" and not pd.isna(fx_lock_rate) and fx_lock_rate > 0:
+        return fx_lock_rate
+    if fx_rates is not None and not fx_rates.empty:
+        return get_fx_rate_at_date(fx_rates, date)
+    if not pd.isna(fx_lock_rate) and fx_lock_rate > 0:
+        return fx_lock_rate
+    return fallback
+
+
+def resolve_price_for_base(
+    price_usd: float,
+    price_krw: float,
+    fx_rate: float,
+    base_currency: str,
+) -> Tuple[float, float, float]:
+    if base_currency == "KRW":
+        if not pd.isna(price_krw) and price_krw > 0:
+            return price_krw, price_usd, price_krw
+        if (
+            not pd.isna(price_usd)
+            and price_usd > 0
+            and not pd.isna(fx_rate)
+            and fx_rate > 0
+        ):
+            price_krw = price_usd * fx_rate
+            return price_krw, price_usd, price_krw
+    else:
+        if not pd.isna(price_usd) and price_usd > 0:
+            return price_usd, price_usd, price_krw
+        if (
+            not pd.isna(price_krw)
+            and price_krw > 0
+            and not pd.isna(fx_rate)
+            and fx_rate > 0
+        ):
+            price_usd = price_krw / fx_rate
+            return price_usd, price_usd, price_krw
+    return np.nan, price_usd, price_krw
+
+
+def recalc_entry_df(
+    current_df: pd.DataFrame,
+    prev_df: pd.DataFrame | None,
+    fx_rates: pd.Series | None,
+    fx_mode: str,
+    fx_lock_rate: float,
+    base_currency: str,
+    force_fx_refresh: bool,
+    entry_columns: List[str],
+) -> pd.DataFrame:
+    current = normalize_entry_df(current_df, entry_columns)
+    prev = normalize_entry_df(prev_df, entry_columns) if prev_df is not None else current.copy()
+    rows = []
+    for idx, row in current.iterrows():
+        prev_row = prev.iloc[idx] if idx < len(prev) else pd.Series(dtype=object)
+        date_ts = row.get("date")
+        date = pd.to_datetime(date_ts, errors="coerce")
+        date_value = date.date() if not pd.isna(date) else dt.date.today()
+
+        amount_base = coerce_float(row.get("amount_base"), np.nan)
+        shares = coerce_float(row.get("shares"), np.nan)
+        price_usd = coerce_float(row.get("price_usd"), np.nan)
+        price_krw = coerce_float(row.get("price_krw"), np.nan)
+        fx_rate = coerce_float(row.get("fx_rate"), np.nan)
+
+        changed_amount = values_different(prev_row.get("amount_base"), amount_base)
+        changed_shares = values_different(prev_row.get("shares"), shares)
+        changed_price_usd = values_different(prev_row.get("price_usd"), price_usd)
+        changed_price_krw = values_different(prev_row.get("price_krw"), price_krw)
+        changed_fx = values_different(prev_row.get("fx_rate"), fx_rate)
+
+        needs_fx = base_currency == "KRW" or (not pd.isna(price_krw) and price_krw > 0)
+        if needs_fx and (force_fx_refresh or changed_fx or pd.isna(fx_rate) or fx_rate <= 0):
+            fx_rate = resolve_fx_rate(
+                date_value, fx_rates, fx_mode, fx_lock_rate, fx_rate
+            )
+
+        if pd.isna(price_usd) and not pd.isna(price_krw) and price_krw > 0 and fx_rate > 0:
+            price_usd = price_krw / fx_rate
+        if pd.isna(price_krw) and not pd.isna(price_usd) and price_usd > 0 and fx_rate > 0:
+            price_krw = price_usd * fx_rate
+        if pd.isna(fx_rate) and not pd.isna(price_usd) and not pd.isna(price_krw) and price_usd > 0:
+            fx_rate = price_krw / price_usd
+
+        price_for_base, price_usd, price_krw = resolve_price_for_base(
+            price_usd, price_krw, fx_rate, base_currency
+        )
+
+        if (
+            (changed_amount and changed_shares)
+            and not pd.isna(amount_base)
+            and amount_base > 0
+            and not pd.isna(shares)
+            and shares > 0
+            and pd.isna(price_for_base)
+        ):
+            price_for_base = amount_base / shares
+            if base_currency == "KRW":
+                price_krw = price_for_base
+                if fx_rate > 0:
+                    price_usd = price_krw / fx_rate
+            else:
+                price_usd = price_for_base
+                if fx_rate > 0:
+                    price_krw = price_usd * fx_rate
+
+        if changed_shares and not changed_amount:
+            if not pd.isna(shares) and shares > 0 and not pd.isna(price_for_base):
+                amount_base = shares * price_for_base
+            elif not pd.isna(amount_base) and amount_base > 0 and not pd.isna(shares) and shares > 0:
+                price_for_base = amount_base / shares
+        elif changed_amount and not changed_shares:
+            if not pd.isna(amount_base) and amount_base > 0 and not pd.isna(price_for_base):
+                shares = amount_base / price_for_base
+            elif not pd.isna(amount_base) and amount_base > 0 and not pd.isna(shares) and shares > 0:
+                price_for_base = amount_base / shares
+        elif changed_amount and changed_shares:
+            if not pd.isna(amount_base) and amount_base > 0 and not pd.isna(shares) and shares > 0:
+                price_for_base = amount_base / shares
+        elif changed_price_usd or changed_price_krw or force_fx_refresh:
+            if not pd.isna(amount_base) and amount_base > 0 and not pd.isna(price_for_base):
+                shares = amount_base / price_for_base
+            elif not pd.isna(shares) and shares > 0 and not pd.isna(price_for_base):
+                amount_base = shares * price_for_base
+        else:
+            if pd.isna(shares) and not pd.isna(amount_base) and amount_base > 0 and not pd.isna(price_for_base):
+                shares = amount_base / price_for_base
+            if pd.isna(amount_base) and not pd.isna(shares) and shares > 0 and not pd.isna(price_for_base):
+                amount_base = shares * price_for_base
+
+        if base_currency == "KRW" and not pd.isna(price_for_base) and price_for_base > 0:
+            price_krw = price_for_base
+            if pd.isna(price_usd) and not pd.isna(fx_rate) and fx_rate > 0:
+                price_usd = price_krw / fx_rate
+        if base_currency == "USD" and not pd.isna(price_for_base) and price_for_base > 0:
+            price_usd = price_for_base
+            if pd.isna(price_krw) and not pd.isna(fx_rate) and fx_rate > 0:
+                price_krw = price_usd * fx_rate
+
+        rows.append(
+            {
+                "date": row.get("date"),
+                "ticker": row.get("ticker"),
+                "name": row.get("name"),
+                "amount_base": amount_base,
+                "price_usd": price_usd,
+                "price_krw": price_krw,
+                "fx_rate": fx_rate,
+                "shares": shares,
+            }
+        )
+    return normalize_entry_df(pd.DataFrame(rows), entry_columns)
+
+
 def get_manual_tx_path() -> Path:
     base_dir = Path(__file__).resolve().parent / "data"
     try:
@@ -1828,13 +2002,14 @@ def main() -> None:
                 st.session_state["price_entry_df"] = entry_df[entry_columns]
                 st.session_state.pop("price_entry_editor", None)
 
+            prev_entry_df = st.session_state.get("price_entry_df")
             price_entry_df = st.data_editor(
                 st.session_state["price_entry_df"],
                 num_rows="fixed",
                 use_container_width=True,
                 hide_index=True,
                 column_config=entry_column_config,
-                disabled=["date", "ticker", "name", "amount_base", "shares"],
+                disabled=["date", "ticker", "name"],
                 key="price_entry_editor",
             )
             entry_fx_rates = None
@@ -1847,19 +2022,20 @@ def main() -> None:
             force_fx_refresh = (
                 st.session_state.get("price_entry_refresh_nonce") != refresh_nonce
             )
-            auto_entry_df = autofill_manual_tx_df(
+            recalculated_df = recalc_entry_df(
                 price_entry_df,
+                prev_entry_df,
                 entry_fx_rates,
                 fx_mode,
                 entry_fx_lock_rate,
                 base_currency,
                 force_fx_refresh,
+                entry_columns,
             )
-            auto_entry_df = normalize_entry_df(auto_entry_df, entry_columns)
             price_entry_df = normalize_entry_df(price_entry_df, entry_columns)
-            if not auto_entry_df.equals(price_entry_df):
+            if not recalculated_df.equals(price_entry_df):
                 st.session_state["price_entry_refresh_nonce"] = refresh_nonce
-                st.session_state["price_entry_df"] = auto_entry_df
+                st.session_state["price_entry_df"] = recalculated_df
                 st.rerun()
             st.session_state["price_entry_df"] = price_entry_df
             st.session_state["price_entry_refresh_nonce"] = refresh_nonce
