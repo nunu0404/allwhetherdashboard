@@ -1665,6 +1665,10 @@ def main() -> None:
 
     today = dt.date.today()
 
+    base_currency = "USD"
+    fx_mode = "live"
+    custom_fx_rate = np.nan
+
     st.sidebar.header("계획 설정")
     st.sidebar.date_input("시작일", value=FIXED_START_DATE, disabled=True)
     start_date = FIXED_START_DATE
@@ -1680,36 +1684,17 @@ def main() -> None:
     monthly_contribution = 0.0
     if plan_mode == "monthly_weight":
         monthly_contribution = st.sidebar.number_input(
-            "월 납입액", min_value=0.0, value=100000.0, step=10000.0
+            f"월 납입액({base_currency})", min_value=0.0, value=100000.0, step=10000.0
         )
     apply_us_holidays = st.sidebar.checkbox(
         "미국 휴장일 반영(휴장 시 다음 거래일로 이월)", value=True
     )
-    base_currency = st.sidebar.selectbox("기준 통화", ["KRW", "USD"], index=0)
-    fx_mode = "live"
-    custom_fx_rate = 0.0
-    if base_currency == "KRW":
-        fx_choice = st.sidebar.selectbox(
-            "환율 적용 방식",
-            ["실시간(시장)", "시작일 고정", "사용자 지정 고정"],
-            index=0,
-        )
-        if fx_choice == "사용자 지정 고정":
-            custom_fx_rate = st.sidebar.number_input(
-                "사용자 지정 환율 (KRW/USD)", min_value=500.0, value=1300.0, step=10.0
-            )
-        fx_mode = {
-            "실시간(시장)": "live",
-            "시작일 고정": "start",
-            "사용자 지정 고정": "custom",
-        }[fx_choice]
-        use_prepost = st.sidebar.checkbox(
-            "장외 가격 포함(새로고침 시)", value=True
-        )
-        if st.sidebar.button("데이터 새로고침"):
-            st.session_state["refresh_nonce"] = st.session_state.get("refresh_nonce", 0) + 1
-            st.cache_data.clear()
-            st.rerun()
+    st.sidebar.caption("기준 통화: USD (고정)")
+    use_prepost = st.sidebar.checkbox("장외 가격 포함(새로고침 시)", value=True)
+    if st.sidebar.button("데이터 새로고침"):
+        st.session_state["refresh_nonce"] = st.session_state.get("refresh_nonce", 0) + 1
+        st.cache_data.clear()
+        st.rerun()
 
     use_manual_transactions = True
 
@@ -1740,8 +1725,8 @@ def main() -> None:
             options=["월", "화", "수", "목", "금", "토", "일"],
             required=True,
         ),
-        "weekly_amount_base": "주간 금액",
-        "target_amount_base": "목표 금액",
+        "weekly_amount_base": f"주간 금액({base_currency})",
+        "target_amount_base": f"목표 금액({base_currency})",
         "target_shares": "목표 수량",
     }
     if "assets_df" not in st.session_state:
@@ -1892,7 +1877,7 @@ def main() -> None:
 
     with st.expander("매수 내역 입력(직접)", expanded=use_manual_transactions):
         st.caption(
-            "체결가(USD 또는 KRW)만 입력하면 환율과 계획 매수금액을 이용해 수량/평단가를 자동 계산합니다."
+            "체결가(USD)와 계획 매수금액을 기준으로 수량/매수금을 자동 계산합니다."
         )
         entry_date = st.date_input(
             "체결가 입력일",
@@ -1931,8 +1916,6 @@ def main() -> None:
                 )
             entry_df = entry_df.rename(columns={"planned_amount_base": "amount_base"})
             entry_df["price_usd"] = np.nan
-            entry_df["price_krw"] = np.nan
-            entry_df["fx_rate"] = np.nan
             entry_df["shares"] = np.nan
 
             existing_manual = normalize_manual_tx_df(st.session_state.get("manual_tx_df"))
@@ -1946,7 +1929,7 @@ def main() -> None:
                 )
                 entry_df = entry_df.merge(
                     existing_manual[
-                        ["date", "ticker", "name", "price_usd", "price_krw", "fx_rate", "amount_base"]
+                        ["date", "ticker", "name", "price_usd", "amount_base", "shares"]
                     ],
                     on=["date", "ticker"],
                     how="left",
@@ -1955,22 +1938,18 @@ def main() -> None:
                 entry_df["price_usd"] = entry_df["price_usd_existing"].combine_first(
                     entry_df["price_usd"]
                 )
-                entry_df["price_krw"] = entry_df["price_krw_existing"].combine_first(
-                    entry_df["price_krw"]
-                )
-                entry_df["fx_rate"] = entry_df["fx_rate_existing"].combine_first(
-                    entry_df["fx_rate"]
-                )
                 entry_df["amount_base"] = entry_df["amount_base_existing"].combine_first(
                     entry_df["amount_base"]
+                )
+                entry_df["shares"] = entry_df["shares_existing"].combine_first(
+                    entry_df["shares"]
                 )
                 entry_df["name"] = entry_df["name_existing"].combine_first(entry_df["name"])
                 entry_df = entry_df.drop(
                     columns=[
                         "price_usd_existing",
-                        "price_krw_existing",
-                        "fx_rate_existing",
                         "amount_base_existing",
+                        "shares_existing",
                         "name_existing",
                     ]
                 )
@@ -1981,8 +1960,6 @@ def main() -> None:
                 "name",
                 "amount_base",
                 "price_usd",
-                "price_krw",
-                "fx_rate",
                 "shares",
             ]
             entry_column_config = {
@@ -1993,8 +1970,6 @@ def main() -> None:
                     f"계획 매수금({base_currency})", format="%.2f"
                 ),
                 "price_usd": st.column_config.NumberColumn("체결가(USD)", format="%.4f"),
-                "price_krw": st.column_config.NumberColumn("체결가(KRW)", format="%.2f"),
-                "fx_rate": st.column_config.NumberColumn("환율(KRW/USD)", format="%.2f"),
                 "shares": st.column_config.NumberColumn("매수 수량", format="%.6f"),
             }
             if st.session_state.get("price_entry_seed") != entry_date:
@@ -2013,11 +1988,7 @@ def main() -> None:
                 key="price_entry_editor",
             )
             entry_fx_rates = None
-            entry_fx_lock_rate = custom_fx_rate if fx_mode == "custom" else np.nan
-            if base_currency == "KRW":
-                entry_fx_rates = download_fx_rates(
-                    entry_date - dt.timedelta(days=7), entry_date
-                )
+            entry_fx_lock_rate = np.nan
             refresh_nonce = st.session_state.get("refresh_nonce", 0)
             force_fx_refresh = (
                 st.session_state.get("price_entry_refresh_nonce") != refresh_nonce
@@ -2055,14 +2026,11 @@ def main() -> None:
             "date": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
             "ticker": "티커",
             "name": "이름",
-            "shares": st.column_config.NumberColumn("수량", format="%.6f"),
-            "price_usd": st.column_config.NumberColumn("체결가(USD)", format="%.4f"),
-            "price_krw": st.column_config.NumberColumn("체결가(KRW)", format="%.2f"),
-            "amount_usd": st.column_config.NumberColumn("매수금(USD)", format="%.2f"),
             "amount_base": st.column_config.NumberColumn(
                 f"매수금({base_currency})", format="%.2f"
             ),
-            "fx_rate": st.column_config.NumberColumn("환율(KRW/USD)", format="%.2f"),
+            "price_usd": st.column_config.NumberColumn("체결가(USD)", format="%.4f"),
+            "shares": st.column_config.NumberColumn("매수 수량", format="%.6f"),
         }
 
         manual_upload = st.file_uploader("매수 내역 CSV 업로드", type=["csv"])
@@ -2083,8 +2051,12 @@ def main() -> None:
                 st.warning(persist_error)
             st.rerun()
 
+        manual_display_cols = ["date", "ticker", "name", "amount_base", "price_usd", "shares"]
+        manual_display_df = st.session_state["manual_tx_df"].reindex(
+            columns=manual_display_cols
+        )
         manual_tx_df = st.data_editor(
-            st.session_state["manual_tx_df"],
+            manual_display_df,
             num_rows="dynamic",
             use_container_width=True,
             hide_index=True,
@@ -2152,20 +2124,9 @@ def main() -> None:
     if manual_date_min and manual_date_min < history_start:
         history_start = manual_date_min
     price_start = history_start if history_start <= today else today - dt.timedelta(days=30)
-    manual_fx_needed = False
-    if isinstance(manual_df, pd.DataFrame):
-        if "price_krw" in manual_df.columns and manual_df["price_krw"].notna().any():
-            manual_fx_needed = True
-        if "fx_rate" in manual_df.columns and manual_df["fx_rate"].notna().any():
-            manual_fx_needed = True
-
     with st.spinner("가격 데이터를 불러오는 중..."):
         prices_usd = download_prices(tickers, price_start, today)
-        fx_rates = (
-            download_fx_rates(price_start, today)
-            if base_currency == "KRW" or manual_fx_needed
-            else None
-        )
+        fx_rates = None
 
     refresh_nonce = st.session_state.get("refresh_nonce", 0)
     if (
